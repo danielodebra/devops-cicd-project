@@ -11,6 +11,7 @@ on:
 permissions:
   contents: read
   packages: write
+  id-token: write
 
 jobs:
   test:
@@ -68,3 +69,76 @@ jobs:
           push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  deploy:
+    name: Deploy to Ubuntu Server
+    needs: docker-build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          tags: tag:ci
+
+      - name: Configure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.HOMELAB_SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/homelab_deploy
+          chmod 600 ~/.ssh/homelab_deploy
+
+      - name: Deploy application
+        env:
+          HOMELAB_HOST: ${{ secrets.HOMELAB_HOST }}
+          HOMELAB_USER: ${{ secrets.HOMELAB_USER }}
+        run: |
+          set -euo pipefail
+
+          ssh-keyscan -H "$HOMELAB_HOST" >> ~/.ssh/known_hosts
+
+          ssh \
+            -i ~/.ssh/homelab_deploy \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            "$HOMELAB_USER@$HOMELAB_HOST" \
+            'set -e
+             docker pull ghcr.io/danielodebra/homelab-status:latest
+             docker stop homelab-status
+             docker rm homelab-status
+             docker run -d \
+               --name homelab-status \
+               --restart unless-stopped \
+               -p 8000:8000 \
+               ghcr.io/danielodebra/homelab-status:latest'
+
+      - name: Verify application health
+        env:
+          HOMELAB_HOST: ${{ secrets.HOMELAB_HOST }}
+          HOMELAB_USER: ${{ secrets.HOMELAB_USER }}
+        run: |
+          set -euo pipefail
+
+          for attempt in $(seq 1 12); do
+            if ssh \
+              -i ~/.ssh/homelab_deploy \
+              -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes \
+              "$HOMELAB_USER@$HOMELAB_HOST" \
+              'curl --fail --silent --show-error http://127.0.0.1:8000/health'
+            then
+              echo "Deployment health check passed."
+              exit 0
+            fi
+
+            echo "Health check attempt $attempt failed; retrying..."
+            sleep 5
+          done
+
+          echo "Deployment health check failed."
+          exit 1
