@@ -93,7 +93,7 @@ jobs:
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/homelab_deploy
           chmod 600 ~/.ssh/homelab_deploy
 
-      - name: Deploy application
+      - name: Deploy application with rollback
         env:
           HOMELAB_HOST: ${{ secrets.HOMELAB_HOST }}
           HOMELAB_USER: ${{ secrets.HOMELAB_USER }}
@@ -106,39 +106,78 @@ jobs:
             -i ~/.ssh/homelab_deploy \
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=yes \
-            "$HOMELAB_USER@$HOMELAB_HOST" \
-            'set -e
-             docker pull ghcr.io/danielodebra/homelab-status:latest
-             docker stop homelab-status
-             docker rm homelab-status
-             docker run -d \
-               --name homelab-status \
-               --restart unless-stopped \
-               -p 8000:8000 \
-               ghcr.io/danielodebra/homelab-status:latest'
-
-      - name: Verify application health
-        env:
-          HOMELAB_HOST: ${{ secrets.HOMELAB_HOST }}
-          HOMELAB_USER: ${{ secrets.HOMELAB_USER }}
-        run: |
+            "$HOMELAB_USER@$HOMELAB_HOST" 'bash -s' <<'REMOTE'
           set -euo pipefail
 
+          CONTAINER_NAME="homelab-status"
+          IMAGE="ghcr.io/danielodebra/homelab-status:latest"
+
+          # Remember the image used by the current container.
+          PREVIOUS_IMAGE_ID="$(docker inspect --format='{{.Image}}' "$CONTAINER_NAME" 2>/dev/null || true)"
+
+          # Pull the new image before touching the running container.
+          docker pull "$IMAGE"
+
+          rollback() {
+            echo "Deployment failed. Attempting rollback..."
+
+            docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+
+            if [ -z "$PREVIOUS_IMAGE_ID" ]; then
+              echo "No previous image is available for rollback."
+              return 1
+            fi
+
+            if ! docker run -d \
+              --name "$CONTAINER_NAME" \
+              --restart unless-stopped \
+              -p 8000:8000 \
+              "$PREVIOUS_IMAGE_ID"; then
+              echo "Failed to start the previous container image."
+              return 1
+            fi
+
+            for attempt in $(seq 1 12); do
+              if curl --fail --silent --show-error http://127.0.0.1:8000/health; then
+                echo
+                echo "Previous version restored successfully."
+                return 0
+              fi
+
+              echo "Rollback health check attempt $attempt failed."
+              sleep 5
+            done
+
+            echo "Rollback failed: previous version did not become healthy."
+            return 1
+          }
+
+          # Replace the running container with the new image.
+          docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+
+          if ! docker run -d \
+            --name "$CONTAINER_NAME" \
+            --restart unless-stopped \
+            -p 8000:8000 \
+            "$IMAGE"; then
+            echo "New container failed to start."
+            rollback || true
+            exit 1
+          fi
+
+          # Verify the new deployment.
           for attempt in $(seq 1 12); do
-            if ssh \
-              -i ~/.ssh/homelab_deploy \
-              -o IdentitiesOnly=yes \
-              -o StrictHostKeyChecking=yes \
-              "$HOMELAB_USER@$HOMELAB_HOST" \
-              'curl --fail --silent --show-error http://127.0.0.1:8000/health'
-            then
-              echo "Deployment health check passed."
+            if curl --fail --silent --show-error http://127.0.0.1:8000/health; then
+              echo
+              echo "New deployment is healthy."
               exit 0
             fi
 
-            echo "Health check attempt $attempt failed; retrying..."
+            echo "Health check attempt $attempt failed."
             sleep 5
           done
 
-          echo "Deployment health check failed."
+          echo "New deployment failed its health checks."
+          rollback || true
           exit 1
+          REMOTE
